@@ -11,7 +11,8 @@ from urllib.request import Request, urlopen
 from urllib.parse import urljoin
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+# ★ 改动：用 patchright 替换原生 playwright（反检测 fork，API 完全兼容）
+from patchright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 DISCORD_TOKEN = os.environ.get("FREEZEHOST_DISCORD_TOKEN", "").strip()
 TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN", "").strip()
@@ -55,7 +56,7 @@ def _mask(text: str) -> str:
     for sid, idx in _SERVER_INDEX.items():
         if sid in text:
             text = text.replace(sid, f"服务器#{idx}")
-    text = re.sub(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.)\d{1,3}\b", r"\1xx", text)
+    text = re.sub(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}.)\d{1,3}\b", r"\1xx", text)
     text = re.sub(r"connect\.sid=[^;\s]+", "connect.sid=***", text)
     return text
 
@@ -264,6 +265,84 @@ def wait_for_site_ready(page) -> bool:
     return False
 
 
+# ★ 新增：处理 Security Verification + Cloudflare Turnstile
+def handle_security_verification(page, timeout_ms: int = 90_000) -> bool:
+    """处理 FreezeHost 新增的 Security Verification 页面里的 Cloudflare Turnstile。
+
+    patchright + WARP 环境下 Turnstile 多数会自动通过；
+    本函数作兜底：检测到复选框就点，检测不到就等跳转。
+
+    返回 True 表示已离开 Security Verification 页（或成功点击/通过）。
+    """
+    log_info("检测 Security Verification / Turnstile...")
+    start = page.evaluate("Date.now()")
+    clicked = False
+    seen_sv = False
+
+    while page.evaluate("Date.now()") - start < timeout_ms:
+        url = page.url
+
+        # 已经跳走 → 续期流程已继续，无需处理
+        if "/dashboard" in url or "success=RENEWED" in url or "err=" in url or "/renew" not in url and "security" not in url.lower() and not page.evaluate("() => document.body && document.body.innerText.includes('Security Verification')"):
+            if seen_sv:
+                log_info("已离开 Security Verification 页面")
+            return True
+
+        # 检测是否还在 Security Verification 页
+        try:
+            is_sv = page.evaluate(
+                "() => document.body && document.body.innerText.includes('Security Verification')"
+            )
+        except Exception:
+            is_sv = False
+
+        if is_sv:
+            if not seen_sv:
+                seen_sv = True
+                log_info("进入 Security Verification 页面，等待 Turnstile 加载...")
+                take_screenshot(page, "security-verification-enter")
+        else:
+            # 没看到 SV 页，但也没跳走，继续等
+            page.wait_for_timeout(2000)
+            continue
+
+        # 在 Turnstile iframe 里找复选框并点击
+        try:
+            for f in page.frames:
+                furl = f.url or ""
+                if "challenges.cloudflare.com" in furl or "turnstile" in furl:
+                    # 复选框 / 可点击区域
+                    cb = f.locator("input[type='checkbox']")
+                    if cb.count() > 0:
+                        try:
+                            if cb.first.is_visible(timeout=2000) and not clicked:
+                                cb.first.click(timeout=5000)
+                                clicked = True
+                                log_info("已点击 Turnstile 复选框")
+                                take_screenshot(page, "turnstile-clicked")
+                                page.wait_for_timeout(3000)
+                        except Exception:
+                            # 有些 Turnstile 不是真 checkbox，点 body 区域即可
+                            try:
+                                f.click("body", timeout=3000)
+                                clicked = True
+                                log_info("已点击 Turnstile iframe 区域")
+                                page.wait_for_timeout(3000)
+                            except Exception:
+                                pass
+                    break
+        except Exception as e:
+            log_warn(f"Turnstile 点击尝试: {e}")
+
+        page.wait_for_timeout(2000)
+
+    # 超时
+    if seen_sv:
+        log_warn("Security Verification 处理超时")
+        take_screenshot(page, "security-verification-timeout")
+    return clicked
+
+
 def handle_oauth_page(page):
     log_info("进入 OAuth 授权页处理")
     page.wait_for_timeout(2000)
@@ -457,8 +536,12 @@ def process_server(page, server_id: str) -> dict:
 
         # ── 执行续期 ─────────────────────────────────────
         page.goto(urljoin(page.url, href), wait_until="domcontentloaded")
+
+        # ★ 新增：处理 Security Verification + Cloudflare Turnstile
+        handle_security_verification(page)
+
         try:
-            page.wait_for_url(lambda u: "/dashboard" in u or "/server-console" in u, timeout=30000)
+            page.wait_for_url(lambda u: "/dashboard" in u or "/server-console" in u, timeout=60_000)
         except PlaywrightTimeout:
             pass
 
@@ -484,7 +567,23 @@ def process_server(page, server_id: str) -> dict:
             result.update(status="tooearly", emoji="⏳", status_label="冷却期",
                           detail=remaining_before or "")
         else:
-            result.update(status="unknown", emoji="❓", status_label="结果未知")
+            # 续期后可能停在 SV 页之后直接跳 dashboard，这里兜底再查一次状态
+            try:
+                page.goto(server_url, wait_until="networkidle")
+                page.wait_for_timeout(3000)
+                after_text = page.evaluate("""() => {
+                    const el = document.getElementById('renewal-status-console');
+                    return el ? el.innerText.trim() : null;
+                }""")
+                after_days = remaining_total_days(after_text)
+                if after_days is not None and total_days is not None and after_days > total_days:
+                    result["after"] = parse_remaining(after_text)
+                    result.update(status="renewed", emoji="✅", status_label="续期成功",
+                                  detail=f"{result['before'] or '?'} → {result['after'] or '?'}")
+                else:
+                    result.update(status="unknown", emoji="❓", status_label="结果未知")
+            except Exception:
+                result.update(status="unknown", emoji="❓", status_label="结果未知")
 
     except Exception as e:
         log_error(f"[{server_id}] 异常: {e}")
@@ -498,10 +597,18 @@ def run():
     if not DISCORD_TOKEN:
         raise RuntimeError("缺少 FREEZEHOST_DISCORD_TOKEN")
 
-    log_info("启动浏览器 (WARP 系统级代理)")
+    log_info("启动浏览器 (patchright + WARP + headed via Xvfb)")
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        # ★ 改动：patchright 反检测最佳实践
+        #   - channel="chrome"：真实 Chrome，规避 Chromium 自动化指纹
+        #   - headless=False：Turnstile 在 headless 下不工作，必须 headed（由 xvfb-run 提供虚拟显示）
+        #   - 不自定义 user_agent / 不 add_init_script，否则反而暴露
+        browser = pw.chromium.launch(
+            channel="chrome",
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
         page = browser.new_page(viewport={"width": VIEWPORT_W, "height": VIEWPORT_H})
         page.set_default_timeout(TIMEOUT)
         log_info("浏览器就绪")
@@ -579,6 +686,9 @@ def run():
             except PlaywrightTimeout:
                 if "discord.com" in page.url:
                     raise RuntimeError("OAuth 超时")
+
+            # ── 回到 FreezeHost 后也可能触发 Turnstile ────
+            handle_security_verification(page)
 
             # ── Dashboard ─────────────────────────────────
             try:
