@@ -164,7 +164,12 @@ def send_tg(caption: str, image_bytes: bytes | None = None):
 def take_screenshot(page, name: str) -> bytes | None:
     try:
         page.set_viewport_size({"width": VIEWPORT_W, "height": VIEWPORT_H})
-        page.wait_for_timeout(500)
+        # ★ 截图前滚回顶部，确保看到服务器信息 + RENEWAL DUE 状态（而不是滚动后的页面下方）
+        try:
+            page.evaluate("window.scrollTo(0, 0)")
+        except Exception:
+            pass
+        page.wait_for_timeout(800)
         path = SCREENSHOT_DIR / f"{name}.png"
         page.screenshot(path=str(path), full_page=False)
         log_info(f"截图已保存: {path}")
@@ -442,7 +447,19 @@ def discover_server_ids(page) -> list[str]:
     return []
 
 
-# ★ 改动核心：process_server —— 关闭通知横幅 + 小幅滚动查找续期链接
+def get_renewal_status(page) -> str | None:
+    """读取续期状态文本（剩余天数/小时）"""
+    try:
+        return page.evaluate("""() => {
+            const el = document.getElementById('renewal-status-console');
+            return el ? el.innerText.trim() : null;
+        }""")
+    except Exception:
+        return None
+
+
+# ★ 改动核心：process_server —— 新版续期入口是按钮，不是 <a> 链接
+#                  滚动量从 250px 改为 300px（按用户要求）
 def process_server(page, server_id: str) -> dict:
     tag = _server_label(server_id)
     server_url = f"{BASE_URL}/server-console?id={server_id}"
@@ -454,15 +471,14 @@ def process_server(page, server_id: str) -> dict:
         page.goto(server_url, wait_until="networkidle")
         page.wait_for_timeout(3000)
 
-        # ★ 关键改动 1：优先关闭顶部通知横幅（Upcoming Server Address Changes 等）
-        # 横幅会挡住续期链接，关掉后链接完全可见，无需大幅滚动
+        # ── 关闭可能的通知横幅 ──────────────────────────
         try:
             dismissed = page.evaluate("""() => {
                 const candidates = ['Acknowledge', 'OK', 'Got it', 'Dismiss', 'Close', '确定', '知道了', '关闭'];
                 for (const text of candidates) {
                     const btns = [...document.querySelectorAll('button, a, [role="button"]')];
                     for (const b of btns) {
-                        if (b.offsetParent === null) continue; // 不可见跳过
+                        if (b.offsetParent === null) continue;
                         const t = (b.innerText || b.textContent || '').trim();
                         if (t && t.toLowerCase() === text.toLowerCase()) {
                             b.click();
@@ -475,67 +491,12 @@ def process_server(page, server_id: str) -> dict:
             if dismissed:
                 log_info(f"已关闭通知横幅: {dismissed}")
                 page.wait_for_timeout(1500)
-            else:
-                log_info("未发现通知横幅（或已被关闭）")
         except Exception as e:
             log_warn(f"关闭横幅尝试异常: {e}")
 
-        # ★ 关键改动 2：小幅滚动查找续期链接（累计最多 800px，不滚到底）
-        # 续期链接本来就在当前视口里，只是可能被挡住，所以只滚动一点点露出它
-        def small_scroll(step_px: int = 250):
-            page.evaluate(f"""() => {{
-                window.scrollBy(0, {step_px});
-                // 内部滚动容器也小幅滚一下
-                document.querySelectorAll('*').forEach(el => {{
-                    if (el.scrollHeight > el.clientHeight + 50 && el.clientHeight < 600) {{
-                        const s = getComputedStyle(el);
-                        if (['auto', 'scroll'].includes(s.overflowY)) {{
-                            el.scrollBy(0, {step_px});
-                        }}
-                    }}
-                }});
-            }}""")
-            page.wait_for_timeout(1200)
-
-        status_text = None
-        renew_href = None
-
-        # 第一次不滚动，直接查（横幅已关，链接应已可见）
-        for attempt in range(6):
-            try:
-                status_text = page.evaluate("""() => {
-                    const el = document.getElementById('renewal-status-console');
-                    return el ? el.innerText.trim() : null;
-                }""")
-            except Exception:
-                status_text = None
-
-            try:
-                renew_href = page.evaluate("""() => {
-                    const rl = document.getElementById('renew-link-modal');
-                    if (rl) { const h = rl.getAttribute('href'); if (h && h !== '#') return {href:h, text:rl.innerText.trim()}; }
-                    for (const a of document.querySelectorAll('a[href*="renew"]')) {
-                        const h = a.getAttribute('href');
-                        if (h && h.includes('renew') && h !== '#') return {href:h, text:a.innerText.trim()};
-                    }
-                    return null;
-                }""")
-            except Exception:
-                renew_href = None
-
-            if renew_href and renew_href.get("href"):
-                break
-
-            # 累计滚动量控制：attempt 0→250, 1→500, 2→750, 之后不再滚（避免滚过头）
-            if attempt < 3:
-                log_info(f"[{server_id}] 第 {attempt+1} 次未找到续期链接，小幅滚动 {(attempt+1)*250}px 重试...")
-                small_scroll(250)
-            else:
-                log_info(f"[{server_id}] 第 {attempt+1} 次仍未找到，停止滚动")
-                break
-
+        # ── 读取续期前状态 ──────────────────────────────
+        status_text = get_renewal_status(page)
         log_info(f"[{server_id}] 续期状态: {status_text or '(空)'}")
-
         remaining_before = parse_remaining(status_text)
         total_days = remaining_total_days(status_text)
         result["before"] = remaining_before
@@ -546,96 +507,185 @@ def process_server(page, server_id: str) -> dict:
                           detail=remaining_before or f"{total_days:.1f}天")
             return result
 
-        # ── 查找续期链接（兜底）─────────────────────────
-        if not (renew_href and renew_href.get("href")):
-            page.evaluate("""() => {
-                const icon = document.querySelector('i.fa-external-link-alt');
-                if (icon) { (icon.closest('button') || icon.parentElement || icon).click(); return; }
-                if (typeof reviewAction === 'function') reviewAction('done');
-            }""")
-            page.wait_for_timeout(2000)
+        # ── 查找并点击续期按钮（2 次滚动重试，累计最多 300px）──
+        # 新版页面续期入口是按钮（带 fa-external-link-alt 图标 / 在 RENEWAL DUE 模块右侧），
+        # 不再是 <a href="/renew?id=xxx">。
+        # 流程：先不滚动找一次 → 滚 150px 找一次 → 再滚 150px（累计 300px）找一次 → 放弃
+        renew_clicked = False
 
-            renew_href = page.evaluate("""() => {
-                const rl = document.getElementById('renew-link-modal');
-                if (rl) { const h = rl.getAttribute('href'); if (h && h !== '#') return {href:h, text:rl.innerText.trim()}; }
-                return null;
-            }""")
+        for scroll_attempt in range(3):  # 0=不滚, 1=滚150px, 2=累计300px
+            if scroll_attempt > 0:
+                log_info(f"[{server_id}] 第 {scroll_attempt} 次滚动 150px 重试查找续期按钮（累计 {scroll_attempt * 150}px）...")
+                try:
+                    page.evaluate("""() => {
+                        window.scrollBy(0, 150);
+                        document.querySelectorAll('*').forEach(el => {
+                            if (el.scrollHeight > el.clientHeight + 50 && el.clientHeight < 600) {
+                                const s = getComputedStyle(el);
+                                if (['auto', 'scroll'].includes(s.overflowY)) el.scrollBy(0, 150);
+                            }
+                        });
+                    }""")
+                    page.wait_for_timeout(1200)
+                except Exception:
+                    pass
 
-        if not (renew_href and renew_href.get("href")):
-            renew_href = page.evaluate(r"""() => {
-                const m = document.body.innerHTML.match(/href=["']((?:\.\.)?\/renew\?id=[a-f0-9]+)["']/i);
-                return m ? {href:m[1], text:'html-extract'} : null;
-            }""")
-
-        if not (renew_href and renew_href.get("href")):
-            # 调试：dump 页面所有链接 + 截图
-            take_screenshot(page, f"no-renew-link-{server_id[:8]}")
+            # 策略 1：点击已知的续期按钮图标（fa-external-link-alt）或含 renew 文字的按钮
             try:
-                all_links = page.evaluate("""() => {
-                    return [...document.querySelectorAll('a[href]')].slice(0, 50).map(a => ({href:a.getAttribute('href'), text:a.innerText.trim().slice(0,40)}));
+                clicked = page.evaluate("""() => {
+                    // 优先：带 fa-external-link-alt 图标的按钮
+                    const icon = document.querySelector('i.fa-external-link-alt');
+                    if (icon) {
+                        const btn = icon.closest('button') || icon.closest('a') || icon.parentElement;
+                        if (btn) { btn.click(); return 'fa-external-link-alt'; }
+                    }
+                    // 其次：包含 renew 文字的按钮/链接
+                    const all = [...document.querySelectorAll('button, a, [role="button"]')];
+                    for (const el of all) {
+                        if (el.offsetParent === null) continue;
+                        const t = (el.innerText || el.textContent || '').trim().toLowerCase();
+                        if (t.includes('renew') && !t.includes('renewal')) {
+                            el.click();
+                            return 'text:' + t.slice(0, 30);
+                        }
+                    }
+                    // 再次：onclick 含 renew 的元素
+                    for (const el of all) {
+                        if (el.offsetParent === null) continue;
+                        const oc = el.getAttribute('onclick') || '';
+                        if (oc.includes('renew')) {
+                            el.click();
+                            return 'onclick:' + oc.slice(0, 30);
+                        }
+                    }
+                    return null;
                 }""")
-                log_warn(f"[{server_id}] 页面链接 dump: {json.dumps(all_links, ensure_ascii=False)[:800]}")
+                if clicked:
+                    log_info(f"[{server_id}] 点击续期按钮: {clicked}")
+                    renew_clicked = True
+                    page.wait_for_timeout(2000)
+                    break
+            except Exception as e:
+                log_warn(f"点击续期按钮异常: {e}")
+
+            # 策略 2：如果有 renew-link-modal 或 a[href*="renew"]，走老路径
+            if not renew_clicked:
+                try:
+                    renew_href = page.evaluate("""() => {
+                        const rl = document.getElementById('renew-link-modal');
+                        if (rl) { const h = rl.getAttribute('href'); if (h && h !== '#') return {href:h, text:rl.innerText.trim()}; }
+                        for (const a of document.querySelectorAll('a[href*="renew"]')) {
+                            const h = a.getAttribute('href');
+                            if (h && h.includes('renew') && h !== '#') return {href:h, text:a.innerText.trim()};
+                        }
+                        return null;
+                    }""")
+                    if renew_href and renew_href.get("href"):
+                        href = renew_href["href"]
+                        log_info(f"[{server_id}] 走链接续期: {href}")
+                        page.goto(urljoin(page.url, href), wait_until="domcontentloaded")
+                        renew_clicked = True
+                        page.wait_for_timeout(2000)
+                        break
+                except Exception:
+                    pass
+
+            # 策略 3：从 HTML 里正则提取 renew?id= 链接
+            if not renew_clicked:
+                try:
+                    renew_href = page.evaluate(r"""() => {
+                        const m = document.body.innerHTML.match(/href=["']((?:\.\.)?\/renew\?id=[a-f0-9]+)["']/i);
+                        return m ? m[1] : null;
+                    }""")
+                    if renew_href:
+                        log_info(f"[{server_id}] 从 HTML 提取续期链接: {renew_href}")
+                        page.goto(urljoin(page.url, renew_href), wait_until="domcontentloaded")
+                        renew_clicked = True
+                        page.wait_for_timeout(2000)
+                        break
+                except Exception:
+                    pass
+
+        if not renew_clicked:
+            # 调试 dump：按钮 + 链接 + 截图
+            take_screenshot(page, f"no-renew-btn-{server_id[:8]}")
+            try:
+                diag = page.evaluate("""() => {
+                    const out = {buttons: [], renew_links: [], icons: []};
+                    document.querySelectorAll('button, a, [role="button"]').forEach(el => {
+                        if (el.offsetParent === null) return;
+                        const t = (el.innerText || el.textContent || '').trim();
+                        const oc = el.getAttribute('onclick') || '';
+                        const h = el.getAttribute('href') || '';
+                        if (t.toLowerCase().includes('renew') || oc.includes('renew') || h.includes('renew')) {
+                            out.buttons.push({tag: el.tagName, text: t.slice(0,40), href: h, onclick: oc.slice(0,50), id: el.id, cls: el.className.slice(0,60)});
+                        }
+                    });
+                    document.querySelectorAll('i[class*="renew"], i[class*="refresh"], i[class*="external"], i.fa-external-link-alt').forEach(el => {
+                        out.icons.push({cls: el.className, parent_tag: el.parentElement ? el.parentElement.tagName : ''});
+                    });
+                    return out;
+                }""")
+                log_warn(f"[{server_id}] 续期元素诊断: {json.dumps(diag, ensure_ascii=False)[:1000]}")
             except Exception:
                 pass
-            raise RuntimeError("未找到续期链接")
+            raise RuntimeError("未找到续期按钮/链接")
 
-        btn_text = renew_href.get("text", "")
-        href = renew_href["href"]
-
-        if btn_text and "renew instance" not in btn_text.lower():
-            if not (total_days is not None and total_days <= 7):
-                result.update(status="tooearly", emoji="⏳", status_label="冷却期",
-                              detail=remaining_before or btn_text)
-                return result
-
-        # ── 执行续期 ─────────────────────────────────────
-        page.goto(urljoin(page.url, href), wait_until="domcontentloaded")
-
-        # ★ 处理 Security Verification + Cloudflare Turnstile
+        # ── 处理 Security Verification + Cloudflare Turnstile ───
         handle_security_verification(page)
 
+        # 等待跳转或状态变化
         try:
-            page.wait_for_url(lambda u: "/dashboard" in u or "/server-console" in u, timeout=60_000)
+            page.wait_for_url(lambda u: "/dashboard" in u or "/server-console" in u
+                              or "success=RENEWED" in u or "err=" in u, timeout=60_000)
         except PlaywrightTimeout:
             pass
 
         url = page.url
+
+        # ── 判断续期结果 ────────────────────────────────
+        # 1) URL 明确结果
         if "success=RENEWED" in url:
-            log_info(f"[{server_id}] 续期成功！")
-            try:
-                page.goto(server_url, wait_until="networkidle")
-                page.wait_for_timeout(3000)
-                after_text = page.evaluate("""() => {
-                    const el = document.getElementById('renewal-status-console');
-                    return el ? el.innerText.trim() : null;
-                }""")
-                result["after"] = parse_remaining(after_text)
-            except Exception:
-                pass
-            result.update(status="renewed", emoji="✅", status_label="续期成功",
-                          detail=f"{result['before'] or '?'} → {result['after'] or '?'}")
+            log_info(f"[{server_id}] 续期成功（URL 确认）")
         elif "err=CANNOTAFFORDRENEWAL" in url:
             result.update(status="broke", emoji="⚠️", status_label="余额不足",
                           detail=remaining_before or "")
+            return result
         elif "err=TOOEARLY" in url:
             result.update(status="tooearly", emoji="⏳", status_label="冷却期",
                           detail=remaining_before or "")
-        else:
-            try:
-                page.goto(server_url, wait_until="networkidle")
-                page.wait_for_timeout(3000)
-                after_text = page.evaluate("""() => {
-                    const el = document.getElementById('renewal-status-console');
-                    return el ? el.innerText.trim() : null;
-                }""")
-                after_days = remaining_total_days(after_text)
-                if after_days is not None and total_days is not None and after_days > total_days:
-                    result["after"] = parse_remaining(after_text)
+            return result
+
+        # 2) 回到 server-console 读取续期后状态
+        try:
+            page.goto(server_url, wait_until="networkidle")
+            page.wait_for_timeout(3000)
+            after_text = get_renewal_status(page)
+            after_days = remaining_total_days(after_text)
+            result["after"] = parse_remaining(after_text)
+
+            if after_days is not None and total_days is not None and after_days > total_days:
+                log_info(f"[{server_id}] 续期成功（状态确认）：{total_days:.2f} → {after_days:.2f} 天")
+                result.update(status="renewed", emoji="✅", status_label="续期成功",
+                              detail=f"{result['before'] or '?'} → {result['after'] or '?'}")
+            elif after_days is not None and after_days > 7:
+                # 状态没有变化但已超过 7 天（可能之前已续期）
+                result.update(status="cooldown", emoji="⏳", status_label="已续期",
+                              detail=result["after"] or f"{after_days:.1f}天")
+            else:
+                # URL 没明确 err，状态也没增长 —— 可能就是点击后页面没跳转但实际续期了
+                if "success=RENEWED" in url:
                     result.update(status="renewed", emoji="✅", status_label="续期成功",
                                   detail=f"{result['before'] or '?'} → {result['after'] or '?'}")
                 else:
-                    result.update(status="unknown", emoji="❓", status_label="结果未知")
-            except Exception:
+                    result.update(status="unknown", emoji="❓", status_label="结果未知",
+                                  detail=result["after"] or remaining_before or "")
+        except Exception as e:
+            log_warn(f"[{server_id}] 读取续期后状态失败: {e}")
+            if "success=RENEWED" in url:
+                result.update(status="renewed", emoji="✅", status_label="续期成功",
+                              detail=result["before"] or "?")
+            else:
                 result.update(status="unknown", emoji="❓", status_label="结果未知")
 
     except Exception as e:
