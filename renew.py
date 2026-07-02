@@ -11,7 +11,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urljoin
 from pathlib import Path
 
-# ★ 改动：用 patchright 替换原生 playwright（反检测 fork，API 完全兼容）
+# patchright 反检测 fork，API 与 playwright 完全兼容
 from patchright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 DISCORD_TOKEN = os.environ.get("FREEZEHOST_DISCORD_TOKEN", "").strip()
@@ -20,7 +20,7 @@ TG_CHAT_ID    = os.environ.get("TG_CHAT_ID", "").strip()
 
 TIMEOUT        = 60_000
 MAX_SITE_RETRIES = 3
-RETRY_WAIT     = 30_000          # ms between retries when site is down
+RETRY_WAIT     = 30_000
 SCREENSHOT_DIR = Path("screenshots")
 SCREENSHOT_DIR.mkdir(exist_ok=True)
 
@@ -199,7 +199,6 @@ def merge_screenshots(browser, buffers: list[bytes]) -> bytes | None:
         pg.close()
 
 def check_site_down(page) -> bool:
-    """Detect FreezeHost 'CONNECTION TO THE MANAGEMENT SERVICES LOST' or similar outage screens."""
     try:
         return page.evaluate("""() => {
             const body = document.body ? document.body.innerText : '';
@@ -213,8 +212,6 @@ def check_site_down(page) -> bool:
 
 
 def wait_for_site_ready(page) -> bool:
-    """Try loading FreezeHost up to MAX_SITE_RETRIES times, handling outage screens.
-    Returns True if site became available, False if still down after all retries."""
     for attempt in range(1, MAX_SITE_RETRIES + 1):
         log_info(f"加载 FreezeHost 首页 (尝试 {attempt}/{MAX_SITE_RETRIES})...")
         try:
@@ -230,8 +227,6 @@ def wait_for_site_ready(page) -> bool:
         if check_site_down(page):
             log_warn(f"FreezeHost 后端服务不可用 (尝试 {attempt})")
             take_screenshot(page, f"site-down-{attempt}")
-
-            # Try clicking the "Retry Now" button on the page itself
             try:
                 retry_btn = page.locator('button:has-text("Retry Now")')
                 if retry_btn.is_visible():
@@ -243,13 +238,11 @@ def wait_for_site_ready(page) -> bool:
                         return True
             except Exception:
                 pass
-
             if attempt < MAX_SITE_RETRIES:
                 log_info(f"等待 {RETRY_WAIT // 1000} 秒后重试...")
                 page.wait_for_timeout(RETRY_WAIT)
             continue
 
-        # Check if the login button is present
         try:
             login_visible = page.locator('span.text-lg:has-text("Login with Discord")').is_visible()
             if login_visible:
@@ -258,22 +251,14 @@ def wait_for_site_ready(page) -> bool:
         except Exception:
             pass
 
-        # Page loaded but no login button and not the known error page — might be OK
         log_info("首页已加载（未检测到宕机页面）")
         return True
 
     return False
 
 
-# ★ 新增：处理 Security Verification + Cloudflare Turnstile
 def handle_security_verification(page, timeout_ms: int = 90_000) -> bool:
-    """处理 FreezeHost 新增的 Security Verification 页面里的 Cloudflare Turnstile。
-
-    patchright + WARP 环境下 Turnstile 多数会自动通过；
-    本函数作兜底：检测到复选框就点，检测不到就等跳转。
-
-    返回 True 表示已离开 Security Verification 页（或成功点击/通过）。
-    """
+    """处理 Security Verification 页面里的 Cloudflare Turnstile。"""
     log_info("检测 Security Verification / Turnstile...")
     start = page.evaluate("Date.now()")
     clicked = False
@@ -282,13 +267,11 @@ def handle_security_verification(page, timeout_ms: int = 90_000) -> bool:
     while page.evaluate("Date.now()") - start < timeout_ms:
         url = page.url
 
-        # 已经跳走 → 续期流程已继续，无需处理
-        if "/dashboard" in url or "success=RENEWED" in url or "err=" in url or "/renew" not in url and "security" not in url.lower() and not page.evaluate("() => document.body && document.body.innerText.includes('Security Verification')"):
+        if "/dashboard" in url or "success=RENEWED" in url or "err=" in url:
             if seen_sv:
                 log_info("已离开 Security Verification 页面")
             return True
 
-        # 检测是否还在 Security Verification 页
         try:
             is_sv = page.evaluate(
                 "() => document.body && document.body.innerText.includes('Security Verification')"
@@ -302,16 +285,13 @@ def handle_security_verification(page, timeout_ms: int = 90_000) -> bool:
                 log_info("进入 Security Verification 页面，等待 Turnstile 加载...")
                 take_screenshot(page, "security-verification-enter")
         else:
-            # 没看到 SV 页，但也没跳走，继续等
             page.wait_for_timeout(2000)
             continue
 
-        # 在 Turnstile iframe 里找复选框并点击
         try:
             for f in page.frames:
                 furl = f.url or ""
                 if "challenges.cloudflare.com" in furl or "turnstile" in furl:
-                    # 复选框 / 可点击区域
                     cb = f.locator("input[type='checkbox']")
                     if cb.count() > 0:
                         try:
@@ -322,7 +302,6 @@ def handle_security_verification(page, timeout_ms: int = 90_000) -> bool:
                                 take_screenshot(page, "turnstile-clicked")
                                 page.wait_for_timeout(3000)
                         except Exception:
-                            # 有些 Turnstile 不是真 checkbox，点 body 区域即可
                             try:
                                 f.click("body", timeout=3000)
                                 clicked = True
@@ -336,7 +315,6 @@ def handle_security_verification(page, timeout_ms: int = 90_000) -> bool:
 
         page.wait_for_timeout(2000)
 
-    # 超时
     if seen_sv:
         log_warn("Security Verification 处理超时")
         take_screenshot(page, "security-verification-timeout")
@@ -463,6 +441,8 @@ def discover_server_ids(page) -> list[str]:
 
     return []
 
+
+# ★ 改动核心：process_server —— 关闭通知横幅 + 小幅滚动查找续期链接
 def process_server(page, server_id: str) -> dict:
     tag = _server_label(server_id)
     server_url = f"{BASE_URL}/server-console?id={server_id}"
@@ -474,10 +454,86 @@ def process_server(page, server_id: str) -> dict:
         page.goto(server_url, wait_until="networkidle")
         page.wait_for_timeout(3000)
 
-        status_text = page.evaluate("""() => {
-            const el = document.getElementById('renewal-status-console');
-            return el ? el.innerText.trim() : null;
-        }""")
+        # ★ 关键改动 1：优先关闭顶部通知横幅（Upcoming Server Address Changes 等）
+        # 横幅会挡住续期链接，关掉后链接完全可见，无需大幅滚动
+        try:
+            dismissed = page.evaluate("""() => {
+                const candidates = ['Acknowledge', 'OK', 'Got it', 'Dismiss', 'Close', '确定', '知道了', '关闭'];
+                for (const text of candidates) {
+                    const btns = [...document.querySelectorAll('button, a, [role="button"]')];
+                    for (const b of btns) {
+                        if (b.offsetParent === null) continue; // 不可见跳过
+                        const t = (b.innerText || b.textContent || '').trim();
+                        if (t && t.toLowerCase() === text.toLowerCase()) {
+                            b.click();
+                            return text;
+                        }
+                    }
+                }
+                return null;
+            }""")
+            if dismissed:
+                log_info(f"已关闭通知横幅: {dismissed}")
+                page.wait_for_timeout(1500)
+            else:
+                log_info("未发现通知横幅（或已被关闭）")
+        except Exception as e:
+            log_warn(f"关闭横幅尝试异常: {e}")
+
+        # ★ 关键改动 2：小幅滚动查找续期链接（累计最多 800px，不滚到底）
+        # 续期链接本来就在当前视口里，只是可能被挡住，所以只滚动一点点露出它
+        def small_scroll(step_px: int = 250):
+            page.evaluate(f"""() => {{
+                window.scrollBy(0, {step_px});
+                // 内部滚动容器也小幅滚一下
+                document.querySelectorAll('*').forEach(el => {{
+                    if (el.scrollHeight > el.clientHeight + 50 && el.clientHeight < 600) {{
+                        const s = getComputedStyle(el);
+                        if (['auto', 'scroll'].includes(s.overflowY)) {{
+                            el.scrollBy(0, {step_px});
+                        }}
+                    }}
+                }});
+            }}""")
+            page.wait_for_timeout(1200)
+
+        status_text = None
+        renew_href = None
+
+        # 第一次不滚动，直接查（横幅已关，链接应已可见）
+        for attempt in range(6):
+            try:
+                status_text = page.evaluate("""() => {
+                    const el = document.getElementById('renewal-status-console');
+                    return el ? el.innerText.trim() : null;
+                }""")
+            except Exception:
+                status_text = None
+
+            try:
+                renew_href = page.evaluate("""() => {
+                    const rl = document.getElementById('renew-link-modal');
+                    if (rl) { const h = rl.getAttribute('href'); if (h && h !== '#') return {href:h, text:rl.innerText.trim()}; }
+                    for (const a of document.querySelectorAll('a[href*="renew"]')) {
+                        const h = a.getAttribute('href');
+                        if (h && h.includes('renew') && h !== '#') return {href:h, text:a.innerText.trim()};
+                    }
+                    return null;
+                }""")
+            except Exception:
+                renew_href = None
+
+            if renew_href and renew_href.get("href"):
+                break
+
+            # 累计滚动量控制：attempt 0→250, 1→500, 2→750, 之后不再滚（避免滚过头）
+            if attempt < 3:
+                log_info(f"[{server_id}] 第 {attempt+1} 次未找到续期链接，小幅滚动 {(attempt+1)*250}px 重试...")
+                small_scroll(250)
+            else:
+                log_info(f"[{server_id}] 第 {attempt+1} 次仍未找到，停止滚动")
+                break
+
         log_info(f"[{server_id}] 续期状态: {status_text or '(空)'}")
 
         remaining_before = parse_remaining(status_text)
@@ -490,19 +546,8 @@ def process_server(page, server_id: str) -> dict:
                           detail=remaining_before or f"{total_days:.1f}天")
             return result
 
-        # ── 查找续期链接 ─────────────────────────────────
-        renew_href = page.evaluate("""() => {
-            const rl = document.getElementById('renew-link-modal');
-            if (rl) { const h = rl.getAttribute('href'); if (h && h !== '#') return {href:h, text:rl.innerText.trim()}; }
-            for (const a of document.querySelectorAll('a[href*="renew"]')) {
-                const h = a.getAttribute('href');
-                if (h && h.includes('renew') && h !== '#') return {href:h, text:a.innerText.trim()};
-            }
-            return null;
-        }""")
-
+        # ── 查找续期链接（兜底）─────────────────────────
         if not (renew_href and renew_href.get("href")):
-            # 尝试点击外链图标
             page.evaluate("""() => {
                 const icon = document.querySelector('i.fa-external-link-alt');
                 if (icon) { (icon.closest('button') || icon.parentElement || icon).click(); return; }
@@ -523,6 +568,15 @@ def process_server(page, server_id: str) -> dict:
             }""")
 
         if not (renew_href and renew_href.get("href")):
+            # 调试：dump 页面所有链接 + 截图
+            take_screenshot(page, f"no-renew-link-{server_id[:8]}")
+            try:
+                all_links = page.evaluate("""() => {
+                    return [...document.querySelectorAll('a[href]')].slice(0, 50).map(a => ({href:a.getAttribute('href'), text:a.innerText.trim().slice(0,40)}));
+                }""")
+                log_warn(f"[{server_id}] 页面链接 dump: {json.dumps(all_links, ensure_ascii=False)[:800]}")
+            except Exception:
+                pass
             raise RuntimeError("未找到续期链接")
 
         btn_text = renew_href.get("text", "")
@@ -537,7 +591,7 @@ def process_server(page, server_id: str) -> dict:
         # ── 执行续期 ─────────────────────────────────────
         page.goto(urljoin(page.url, href), wait_until="domcontentloaded")
 
-        # ★ 新增：处理 Security Verification + Cloudflare Turnstile
+        # ★ 处理 Security Verification + Cloudflare Turnstile
         handle_security_verification(page)
 
         try:
@@ -567,7 +621,6 @@ def process_server(page, server_id: str) -> dict:
             result.update(status="tooearly", emoji="⏳", status_label="冷却期",
                           detail=remaining_before or "")
         else:
-            # 续期后可能停在 SV 页之后直接跳 dashboard，这里兜底再查一次状态
             try:
                 page.goto(server_url, wait_until="networkidle")
                 page.wait_for_timeout(3000)
@@ -592,7 +645,7 @@ def process_server(page, server_id: str) -> dict:
 
     return result
 
-#  主流程
+
 def run():
     if not DISCORD_TOKEN:
         raise RuntimeError("缺少 FREEZEHOST_DISCORD_TOKEN")
@@ -600,10 +653,6 @@ def run():
     log_info("启动浏览器 (patchright + WARP + headed via Xvfb)")
 
     with sync_playwright() as pw:
-        # ★ 改动：patchright 反检测最佳实践
-        #   - channel="chrome"：真实 Chrome，规避 Chromium 自动化指纹
-        #   - headless=False：Turnstile 在 headless 下不工作，必须 headed（由 xvfb-run 提供虚拟显示）
-        #   - 不自定义 user_agent / 不 add_init_script，否则反而暴露
         browser = pw.chromium.launch(
             channel="chrome",
             headless=False,
@@ -616,7 +665,6 @@ def run():
         display_name = "未知用户"
 
         try:
-            # ── 出口 IP ───────────────────────────────────
             log_info("验证出口 IP...")
             try:
                 ip = json.loads(page.goto("https://api.ipify.org?format=json",
@@ -625,7 +673,6 @@ def run():
             except Exception:
                 log_warn("IP 验证超时")
 
-            # ── 检测站点可用性（带重试） ─────────────────
             log_info("打开 FreezeHost 登录页")
             if not wait_for_site_ready(page):
                 buf = take_screenshot(page, "site-down-final")
@@ -638,9 +685,8 @@ def run():
                 )
                 send_tg(msg, buf)
                 log_warn("站点宕机，本次跳过续期")
-                return   # Exit gracefully — not a script error
+                return
 
-            # ── 登录 ─────────────────────────────────────
             page.click('span.text-lg:has-text("Login with Discord")', timeout=15_000)
 
             confirm_btn = page.locator("button#confirm-login")
@@ -651,7 +697,6 @@ def run():
             page.wait_for_url(re.compile(r"discord\.com"), timeout=15000)
             log_info("已到达 Discord")
 
-            # ── 注入 Token ────────────────────────────────
             page.evaluate("""(token) => {
                 const f = document.createElement('iframe');
                 f.style.display = 'none';
@@ -671,7 +716,6 @@ def run():
 
             log_info("Token 注入成功")
 
-            # ── OAuth ─────────────────────────────────────
             try:
                 page.wait_for_url(re.compile(r"discord\.com/oauth2/authorize"), timeout=6000)
                 page.wait_for_timeout(2000)
@@ -687,10 +731,8 @@ def run():
                 if "discord.com" in page.url:
                     raise RuntimeError("OAuth 超时")
 
-            # ── 回到 FreezeHost 后也可能触发 Turnstile ────
             handle_security_verification(page)
 
-            # ── Dashboard ─────────────────────────────────
             try:
                 page.wait_for_url(lambda u: "/callback" in u or "/dashboard" in u, timeout=10000)
             except PlaywrightTimeout:
@@ -703,21 +745,18 @@ def run():
 
             log_info("登录成功")
 
-            # ── 邮箱（唯一显示名） ───────────────────────
             email = extract_email(page)
             if email:
                 display_name = email
             else:
                 log_warn("邮箱获取失败，TG 将显示「未知用户」")
 
-            # ── 发现服务器 ────────────────────────────────
             server_ids = discover_server_ids(page)
             if not server_ids:
                 buf = take_screenshot(page, "no-servers")
                 send_tg(f"用户：{display_name}\n⚠️ 未发现服务器\n\nFreezeHost Auto Renew", buf)
                 return
 
-            # ── 逐台处理 ─────────────────────────────────
             results, screenshots = [], []
             for sid in server_ids:
                 log_info("=" * 50)
@@ -727,12 +766,10 @@ def run():
                 if buf:
                     screenshots.append(buf)
 
-            # ── 合并截图 ─────────────────────────────────
             final_img = (screenshots[0] if len(screenshots) == 1
                          else merge_screenshots(browser, screenshots) if screenshots
                          else None)
 
-            # ── TG 推送（完整信息） ──────────────────────
             lines = []
             for r in results:
                 s = f"服务器: {r['server_id']} | {r['emoji']}{r['status_label']}"
