@@ -25,7 +25,7 @@ jobs:
   renew:
     name: 执行续期
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     permissions:
       contents: write
       actions: write
@@ -62,10 +62,12 @@ jobs:
 
       - name: 安装依赖
         run: |
-          pip install playwright
-          playwright install chromium --with-deps
+          # ★ 改动：用 patchright 替换原生 playwright（反检测 fork，API 完全兼容）
+          pip install patchright
+          # 推荐用真实 Chrome（channel="chrome"），比 Chromium 更难被检测
+          patchright install chrome
           sudo apt-get update
-          sudo apt-get install -y jq bc
+          sudo apt-get install -y jq bc xvfb google-chrome-stable
 
       - name: 启用 WARP 网络
         uses: fscarmen/warp-on-actions@v1.3
@@ -118,7 +120,9 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
           echo "使用 Token 编号: ${{ steps.select_token.outputs.token_number }}"
-          python renew.py 2>&1 | tee renew.log
+          # ★ 改动：用 xvfb-run 包裹跑 headed 模式（Turnstile 在 headless 下不工作）
+          # -a 自动分配空闲显示号；提供虚拟显示器让 Chrome 以为有屏幕
+          xvfb-run -a --server-args="-screen 0 1280x800x24" python renew.py 2>&1 | tee renew.log
 
       - name: 提取剩余天数（取所有服务器的最小值）
         id: extract_days
